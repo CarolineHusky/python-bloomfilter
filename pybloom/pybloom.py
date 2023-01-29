@@ -3,41 +3,44 @@
 an a Scalable Bloom Filter that grows in size as your add more items to it
 without increasing the false positive error_rate.
 
+Futhermore it implements a caching function that only caches data after it's been encountered at least twice.
+
 Requires the bitarray library: http://pypi.python.org/pypi/bitarray/
 
     >>> from pybloom import BloomFilter
     >>> f = BloomFilter(capacity=10000, error_rate=0.001)
-    >>> for i in range_fn(0, f.capacity):
+    >>> for i in range(0, f.capacity):
     ...     _ = f.add(i)
     ...
     >>> 0 in f
     True
     >>> f.capacity in f
     False
-    >>> len(f) <= f.capacity
+    >>> f.estimated_count <= f.capacity
     True
-    >>> (1.0 - (len(f) / float(f.capacity))) <= f.error_rate + 2e-18
+    >>> (1.0 - (f.estimated_count / float(f.capacity))) <= f.error_rate + 2e-18
     True
 
     >>> from pybloom import ScalableBloomFilter
     >>> sbf = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
     >>> count = 10000
-    >>> for i in range_fn(0, count):
+    >>> for i in range(0, count):
     ...     _ = sbf.add(i)
     ...
     >>> sbf.capacity > count
     True
-    >>> len(sbf) <= count
-    True
-    >>> (1.0 - (len(sbf) / float(count))) <= sbf.error_rate + 2e-18
+    >>> sbf.estimated_count <= count
     True
 
 """
+
 from __future__ import absolute_import
 import math
 import hashlib
-from pybloom.utils import range_fn, is_string_io, running_python_3
+from functools import cached_property
 from struct import unpack, pack, calcsize
+from io import BytesIO     
+import os, pickle, atexit
 
 try:
     import bitarray
@@ -73,18 +76,12 @@ def make_hashfuncs(num_slices, num_bits):
     num_salts, extra = divmod(num_slices, len(fmt))
     if extra:
         num_salts += 1
-    salts = tuple(hashfn(hashfn(pack('I', i)).digest()) for i in range_fn(num_salts))
+    salts = tuple(hashfn(hashfn(pack('I', i)).digest()) for i in range(num_salts))
     def _make_hashfuncs(key):
-        if running_python_3:
-            if isinstance(key, str):
-                key = key.encode('utf-8')
-            else:
-                key = str(key).encode('utf-8')
+        if isinstance(key, str):
+            key = key.encode('utf-8')
         else:
-            if isinstance(key, unicode):
-                key = key.encode('utf-8')
-            else:
-                key = str(key)
+            key = str(key).encode('utf-8')
         i = 0
         for salt in salts:
             h = salt.copy()
@@ -145,7 +142,10 @@ class BloomFilter(object):
         self.capacity = capacity
         self.num_bits = num_slices * bits_per_slice
         self.count = count
+        if count>=self.capacity: #if we exceed the maximum capacity, then we can only guess the amount of entries
+            self.count=None
         self.make_hashes = make_hashfuncs(self.num_slices, self.bits_per_slice)
+
 
     def __contains__(self, key):
         """Tests a key's membership in this bloom filter.
@@ -169,7 +169,34 @@ class BloomFilter(object):
 
     def __len__(self):
         """Return the number of keys stored by this bloom filter."""
-        return self.count
+        if self.is_exact:
+            return self.count
+        raise IndexError("Uncertain amount of stored keys")
+        
+        
+    @property
+    def is_exact(self):
+        return self.count!=None
+        
+        
+    @cached_property
+    def estimated_count(self):
+        if self.is_exact:
+            return self.count
+        if not self.bitarray.any(): #we do know that a bitarray with no bits set is at count=0
+            self.count=0
+            return 0
+        return -(self.num_bits / self.num_slices) * math.log(1-self.bitarray.count()/self.num_bits) # Swamidass & Baldi
+        
+        
+    def increment_count(self):
+        if self.count!=None:
+            self.count += 1
+            if self.count>=self.capacity: #if we exceed the maximum capacity, then we can only guess the amount of entries
+                self.count=None
+        del self.estimated_count
+        
+    
 
     def add(self, key, skip_check=False):
         """ Adds a key to this bloom filter. If the key already exists in this
@@ -188,7 +215,7 @@ class BloomFilter(object):
         bits_per_slice = self.bits_per_slice
         hashes = self.make_hashes(key)
         found_all_bits = True
-        if self.count > self.capacity:
+        if self.estimated_count > self.capacity:
             raise IndexError("BloomFilter is at capacity")
         offset = 0
         for k in hashes:
@@ -198,19 +225,38 @@ class BloomFilter(object):
             offset += bits_per_slice
 
         if skip_check:
-            self.count += 1
+            self.increment_count()
             return False
         elif not found_all_bits:
-            self.count += 1
+            self.increment_count()
             return False
         else:
             return True
+            
+            
+    def __add__(self, other):
+        """Returns a copy of this bloom filter with elements added
+        
+        If other is a bloomfilter, perform an union and returns the result. Else, add elements and returns the result.
+        
+        Raises IndexError if filter is at capacity
+        """
+        if isinstance(other, BloomFilter):
+            return self.union(other)
+        new_bloom=self.copy()
+        new_bloom.add(other)
+        return new_bloom
+        
 
-    def copy(self):
+    def copy(self, preserve_count=True):
         """Return a copy of this bloom filter.
         """
         new_filter = BloomFilter(self.capacity, self.error_rate)
         new_filter.bitarray = self.bitarray.copy()
+        if preserve_count:
+            new_filter.count = self.count
+        else:
+            new_filter.count = None
         return new_filter
 
     def union(self, other):
@@ -220,7 +266,7 @@ class BloomFilter(object):
             self.error_rate != other.error_rate:
             raise ValueError("Unioning filters requires both filters to have \
 both the same capacity and error rate")
-        new_bloom = self.copy()
+        new_bloom = self.copy(preserve_count=False)
         new_bloom.bitarray = new_bloom.bitarray | other.bitarray
         return new_bloom
 
@@ -234,7 +280,7 @@ both the same capacity and error rate")
             self.error_rate != other.error_rate:
             raise ValueError("Intersecting filters requires both filters to \
 have equal capacity and error rate")
-        new_bloom = self.copy()
+        new_bloom = self.copy(preserve_count=False)
         new_bloom.bitarray = new_bloom.bitarray & other.bitarray
         return new_bloom
 
@@ -245,9 +291,12 @@ have equal capacity and error rate")
         """Write the bloom filter to file object `f'. Underlying bits
         are written as machine values. This is much more space
         efficient than pickling the object."""
+        count=self.count
+        if not self.is_exact:
+            count=2**64-1
         f.write(pack(self.FILE_FMT, self.error_rate, self.num_slices,
-                     self.bits_per_slice, self.capacity, self.count))
-        (f.write(self.bitarray.tobytes()) if is_string_io(f)
+                     self.bits_per_slice, self.capacity, count))
+        (f.write(self.bitarray.tobytes()) if isinstance(f, BytesIO)
          else self.bitarray.tofile(f))
 
     @classmethod
@@ -263,14 +312,14 @@ have equal capacity and error rate")
         filter._setup(*unpack(cls.FILE_FMT, f.read(headerlen)))
         filter.bitarray = bitarray.bitarray(endian='little')
         if n > 0:
-            (filter.bitarray.frombytes(f.read(n-headerlen)) if is_string_io(f)
+            (filter.bitarray.frombytes(f.read(n-headerlen)) if isinstance(f, BytesIO)
              else filter.bitarray.fromfile(f, n - headerlen))
         else:
-            (filter.bitarray.frombytes(f.read()) if is_string_io(f)
+            (filter.bitarray.frombytes(f.read()) if isinstance(f, BytesIO)
              else filter.bitarray.fromfile(f))
-        if filter.num_bits != filter.bitarray.length() and \
+        if filter.num_bits != len(filter.bitarray) and \
                (filter.num_bits + (8 - filter.num_bits % 8)
-                != filter.bitarray.length()):
+                != len(filter.bitarray)):
             raise ValueError('Bit length mismatch!')
 
         return filter
@@ -323,6 +372,7 @@ class ScalableBloomFilter(object):
             raise ValueError("Error_Rate must be a decimal less than 0.")
         self._setup(mode, 0.9, initial_capacity, error_rate)
         self.filters = []
+        self.outfile = None
 
     def _setup(self, mode, ratio, initial_capacity, error_rate):
         self.scale = mode
@@ -368,7 +418,7 @@ class ScalableBloomFilter(object):
             self.filters.append(filter)
         else:
             filter = self.filters[-1]
-            if filter.count >= filter.capacity:
+            if filter.estimated_count >= filter.capacity:
                 filter = BloomFilter(
                     capacity=filter.capacity * self.scale,
                     error_rate=filter.error_rate * self.ratio)
@@ -426,11 +476,70 @@ class ScalableBloomFilter(object):
 
         return filter
 
+    @property
+    def estimated_count(self):
+        """Returns the estimated number of elements stored in this SBF"""
+        return sum(f.estimated_count for f in self.filters)
+
     def __len__(self):
         """Returns the total number of elements stored in this SBF"""
         return sum(f.count for f in self.filters)
+        
+    def __del__(self):
+        if self.outfile:
+            self.tofile(self.outfile)
+        
 
+def blooming(_backup_file):
+    """Funky caching function that only caches a function's result if it's at least called twice.
+    
+    Optionally accepts a filename as argument in which it will persist it's cache across time.
+    """
+    if callable(_backup_file):
+        backup_file=None
+    else:
+        backup_file=_backup_file
+        
+    def function(user_function):
+        cache={}
+        if backup_file:
+            if os.path.exists(backup_file):
+                with open(backup_file,"rb") as f:
+                    cache=pickle.load(f)
+                    
+                    
+            bloom_filter=ScalableBloomFilter()
+            for ele in cache:
+                bloom_filter.add(ele)
+                
+                
+            def bloom_del(bloom_filter):
+                #test if updated values from disk file
+                if os.path.exists(backup_file):
+                    with open(backup_file,"rb") as f:
+                        newcache=pickle.load(f)
+                        for ele in newcache:
+                            cache[ele]=newcache[ele]
+                            
+                with open(backup_file,"wb") as f:
+                    pickle.dump(cache,f)
+                    
+                    
+            atexit.register(bloom_del, bloom_filter)
+        else:
+            bloom_filter=ScalableBloomFilter()
+            
+        def decorated(*args,**kwargs):
+            key=pickle.dumps((args,kwargs))
+            if bloom_filter.add(key):
+                if key not in cache:
+                    cache[key]=user_function(*args,**kwargs)
+                return cache[key]
+            return user_function(*args,**kwargs)
+        return decorated
+        
+    if backup_file==None:
+        return function(_backup_file)
+        
+    return function
 
-if __name__ == "__main__":
-    import doctest
-    doctest.testmod()
