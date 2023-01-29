@@ -37,6 +37,7 @@ Requires the bitarray library: http://pypi.python.org/pypi/bitarray/
 from __future__ import absolute_import
 import math
 import hashlib
+import functools
 from functools import cached_property
 from struct import unpack, pack, calcsize
 from io import BytesIO     
@@ -530,7 +531,7 @@ def blooming(_backup_file):
             bloom_filter=ScalableBloomFilter()
             
         def decorated(*args,**kwargs):
-            key=pickle.dumps((args,kwargs))
+            key=functools._make_key(args,kwargs, False)
             if bloom_filter.add(key):
                 if key not in cache:
                     cache[key]=user_function(*args,**kwargs)
